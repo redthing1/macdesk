@@ -1,0 +1,7 @@
+/notes/
+!/AGENTS.md
+/.venv/
+/.ruff_cache/
+__pycache__/
+*.pyc
+/dist/

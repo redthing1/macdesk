@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "macdesk"
+version = "0.1.0"
+description = "ARM64 macOS build sandboxes on Linux"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["paramiko>=4,<5"]
+
+[project.scripts]
+macdesk = "macdesk.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/macdesk"]
+
+[tool.hatch.build]
+exclude = ["/notes", "/AGENTS.md"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.3",
+]

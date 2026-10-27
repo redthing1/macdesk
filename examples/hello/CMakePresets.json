@@ -1,0 +1,16 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "dev",
+      "generator": "Ninja",
+      "binaryDir": "$env{HOME}/work/macdesk-hello/build"
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" }
+  ],
+  "testPresets": [
+    { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } }
+  ]
+}

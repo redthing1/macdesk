@@ -1,0 +1,400 @@
+diff --git a/hw/intc/arm_gicv2m.c b/hw/intc/arm_gicv2m.c
+index b343e17..1eb2b8b 100644
+--- a/hw/intc/arm_gicv2m.c
++++ b/hw/intc/arm_gicv2m.c
+@@ -57,6 +57,7 @@ struct ARMGICv2mState {
+ 
+     uint32_t base_spi;
+     uint32_t num_spi;
++    bool typer_valid;
+ };
+ 
+ static void gicv2m_set_irq(void *opaque, int irq)
+@@ -81,6 +82,9 @@ static uint64_t gicv2m_read(void *opaque, hwaddr offset,
+     case V2M_MSI_TYPER:
+         val = (s->base_spi + 32) << 16;
+         val |= s->num_spi;
++        if (s->typer_valid) {
++            val |= 1u << 31;
++        }
+         return val;
+     case V2M_MSI_IIDR:
+         /* We don't have any valid implementor so we leave that field as zero
+@@ -173,6 +177,7 @@ static void gicv2m_init(Object *obj)
+ static const Property gicv2m_properties[] = {
+     DEFINE_PROP_UINT32("base-spi", ARMGICv2mState, base_spi, 0),
+     DEFINE_PROP_UINT32("num-spi", ARMGICv2mState, num_spi, 64),
++    DEFINE_PROP_BOOL("typer-valid", ARMGICv2mState, typer_valid, false),
+ };
+ 
+ static void gicv2m_class_init(ObjectClass *klass, const void *data)
+diff --git a/hw/virtio/vhost-user-fs-pci.c b/hw/virtio/vhost-user-fs-pci.c
+index 92ae2fc..72f88dd 100644
+--- a/hw/virtio/vhost-user-fs-pci.c
++++ b/hw/virtio/vhost-user-fs-pci.c
+@@ -20,6 +20,7 @@
+ struct VHostUserFSPCI {
+     VirtIOPCIProxy parent_obj;
+     VHostUserFS vdev;
++    bool ascending_capabilities;
+ };
+ 
+ typedef struct VHostUserFSPCI VHostUserFSPCI;
+@@ -30,6 +31,8 @@ DECLARE_INSTANCE_CHECKER(VHostUserFSPCI, VHOST_USER_FS_PCI,
+                          TYPE_VHOST_USER_FS_PCI)
+ 
+ static const Property vhost_user_fs_pci_properties[] = {
++    DEFINE_PROP_BOOL("x-ascending-capabilities", VHostUserFSPCI,
++                     ascending_capabilities, false),
+     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
+                        DEV_NVECTORS_UNSPECIFIED),
+ };
+@@ -45,6 +48,25 @@ static void vhost_user_fs_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
+     }
+ 
+     qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
++    if (dev->ascending_capabilities && qdev_is_realized(vdev)) {
++        uint8_t *config = vpci_dev->pci_dev.config;
++        bool capabilities[PCI_CONFIG_SPACE_SIZE] = { false };
++        unsigned offset, previous = PCI_CAPABILITY_LIST;
++
++        /* Allow guests that require PCI capabilities in address order. */
++        for (offset = config[PCI_CAPABILITY_LIST]; offset;
++             offset = config[offset + PCI_CAP_LIST_NEXT]) {
++            capabilities[offset] = true;
++        }
++        for (offset = PCI_CONFIG_HEADER_SIZE; offset < PCI_CONFIG_SPACE_SIZE;
++             offset++) {
++            if (capabilities[offset]) {
++                config[previous] = offset;
++                previous = offset + PCI_CAP_LIST_NEXT;
++            }
++        }
++        config[previous] = 0;
++    }
+ }
+ 
+ static void vhost_user_fs_pci_class_init(ObjectClass *klass, const void *data)
+diff --git a/hw/virtio/virtio-net-pci.c b/hw/virtio/virtio-net-pci.c
+index fd3e030..4a6c47a 100644
+--- a/hw/virtio/virtio-net-pci.c
++++ b/hw/virtio/virtio-net-pci.c
+@@ -36,9 +36,12 @@ DECLARE_INSTANCE_CHECKER(VirtIONetPCI, VIRTIO_NET_PCI,
+ struct VirtIONetPCI {
+     VirtIOPCIProxy parent_obj;
+     VirtIONet vdev;
++    bool ascending_capabilities;
+ };
+ 
+ static const Property virtio_net_properties[] = {
++    DEFINE_PROP_BOOL("x-ascending-capabilities", VirtIONetPCI,
++                     ascending_capabilities, false),
+     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
+                     VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
+     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
+@@ -61,6 +64,28 @@ static void virtio_net_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
+     virtio_net_set_netclient_name(&dev->vdev, qdev->id,
+                                   object_get_typename(OBJECT(qdev)));
+     qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
++
++    if (dev->ascending_capabilities && qdev_is_realized(vdev)) {
++        uint8_t *config = vpci_dev->pci_dev.config;
++        bool capabilities[PCI_CONFIG_SPACE_SIZE] = { false };
++        unsigned offset, previous = PCI_CAPABILITY_LIST;
++
++        /* Local Golden Gate workaround: its cached and fallback capability
++         * lookups revisit PCI_CFG and NOTIFY forever on descending lists.
++         * Keep capability contents and offsets; only reorder the links. */
++        for (offset = config[PCI_CAPABILITY_LIST]; offset;
++             offset = config[offset + PCI_CAP_LIST_NEXT]) {
++            capabilities[offset] = true;
++        }
++        for (offset = PCI_CONFIG_HEADER_SIZE; offset < PCI_CONFIG_SPACE_SIZE;
++             offset++) {
++            if (capabilities[offset]) {
++                config[previous] = offset;
++                previous = offset + PCI_CAP_LIST_NEXT;
++            }
++        }
++        config[previous] = 0;
++    }
+ }
+ 
+ static void virtio_net_pci_class_init(ObjectClass *klass, const void *data)
+diff --git a/hw/virtio/virtio-qmp.c b/hw/virtio/virtio-qmp.c
+index 57cc038..3690718 100644
+--- a/hw/virtio/virtio-qmp.c
++++ b/hw/virtio/virtio-qmp.c
+@@ -713,6 +713,8 @@ VirtioStatus *qmp_x_query_virtio_status(const char *path, Error **errp)
+                                                  vdev->guest_features_ex);
+     status->host_features = qmp_decode_features(vdev->device_id,
+                                                 vdev->host_features_ex);
++    status->backend_features = qmp_decode_features(vdev->device_id,
++                                                   vdev->backend_features_ex);
+ 
+     switch (vdev->device_endian) {
+     case VIRTIO_DEVICE_ENDIAN_LITTLE:
+diff --git a/hw/vmapple/cfg.c b/hw/vmapple/cfg.c
+index 2a3204f..65c5617 100644
+--- a/hw/vmapple/cfg.c
++++ b/hw/vmapple/cfg.c
+@@ -19,7 +19,7 @@
+ 
+ OBJECT_DECLARE_SIMPLE_TYPE(VMAppleCfgState, VMAPPLE_CFG)
+ 
+-#define VMAPPLE_CFG_SIZE 0x00010000
++#define VMAPPLE_CFG_SIZE 0x00100000
+ 
+ typedef struct VMAppleCfg {
+     uint32_t version;         /* 0x000 */
+diff --git a/hw/vmapple/virtio-blk.c b/hw/vmapple/virtio-blk.c
+index 9de9aaa..0a52972 100644
+--- a/hw/vmapple/virtio-blk.c
++++ b/hw/vmapple/virtio-blk.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "hw/pci/pci.h"
+ #include "hw/vmapple/vmapple.h"
+ #include "hw/virtio/virtio-blk.h"
+ #include "hw/virtio/virtio-pci.h"
+@@ -44,6 +45,8 @@ typedef struct VMAppleVirtIOBlk {
+ OBJECT_DECLARE_SIMPLE_TYPE(VMAppleVirtIOBlkPCI, VMAPPLE_VIRTIO_BLK_PCI)
+ 
+ #define VIRTIO_BLK_T_APPLE_BARRIER     0x10000
++#define VMAPPLE_PCI_VNDR_SIZE 14
++#define VMAPPLE_PCI_VNDR_DISABLE_ENCRYPTION 1
+ 
+ static bool vmapple_virtio_blk_handle_unknown_request(VirtIOBlockReq *req,
+                                                       MultiReqBuffer *mrb,
+@@ -125,6 +128,10 @@ static void vmapple_virtio_blk_pci_realize(VirtIOPCIProxy *vpci_dev, Error **err
+     VMAppleVirtIOBlkPCI *dev = VMAPPLE_VIRTIO_BLK_PCI(vpci_dev);
+     DeviceState *vdev = DEVICE(&dev->vdev);
+     VirtIOBlkConf *conf = &dev->vdev.parent_obj.conf;
++    int offset;
++    uint8_t capabilities[PCI_CONFIG_SPACE_SIZE] = { 0 };
++    uint8_t *config = vpci_dev->pci_dev.config;
++    int previous = PCI_CAPABILITY_LIST;
+ 
+     if (dev->variant == VM_APPLE_VIRTIO_BLK_VARIANT_UNSPECIFIED) {
+         error_setg(errp, "vmapple virtio block device variant unspecified");
+@@ -162,6 +169,38 @@ static void vmapple_virtio_blk_pci_realize(VirtIOPCIProxy *vpci_dev, Error **err
+     pci_config_set_vendor_id(vpci_dev->pci_dev.config, PCI_VENDOR_ID_APPLE);
+     pci_config_set_device_id(vpci_dev->pci_dev.config,
+                              PCI_DEVICE_ID_APPLE_VIRTIO_BLK);
++    pci_set_word(vpci_dev->pci_dev.config + PCI_SUBSYSTEM_ID, 0x1100);
++
++    /* A non-FileVault Golden Gate root disk requires Apple's vendor
++     * capability to advertise that transport encryption is disabled. */
++    offset = pci_add_capability(&vpci_dev->pci_dev, PCI_CAP_ID_VNDR, 0,
++                                VMAPPLE_PCI_VNDR_SIZE, errp);
++    if (offset < 0) {
++        return;
++    }
++    pci_set_byte(vpci_dev->pci_dev.config + offset + 2,
++                 VMAPPLE_PCI_VNDR_SIZE);
++    pci_set_byte(vpci_dev->pci_dev.config + offset + 3, 9);
++    pci_set_word(vpci_dev->pci_dev.config + offset + 4, PCI_VENDOR_ID_APPLE);
++    pci_set_byte(vpci_dev->pci_dev.config + offset + 6,
++                 VMAPPLE_PCI_VNDR_DISABLE_ENCRYPTION);
++
++    /* Golden Gate's cached capability lookup and its fallback disagree on
++     * descending lists: the storage probe alternates between the final
++     * vendor capability and VIRTIO_PCI_CAP_PCI_CFG forever. Keep the same
++     * capabilities and offsets, but enumerate them in address order. */
++    for (offset = config[PCI_CAPABILITY_LIST]; offset;
++         offset = config[offset + PCI_CAP_LIST_NEXT]) {
++        capabilities[offset] = 1;
++    }
++    for (offset = PCI_CONFIG_HEADER_SIZE; offset < PCI_CONFIG_SPACE_SIZE;
++         offset++) {
++        if (capabilities[offset]) {
++            config[previous] = offset;
++            previous = offset + PCI_CAP_LIST_NEXT;
++        }
++    }
++    config[previous] = 0;
+ }
+ 
+ static void vmapple_virtio_blk_pci_class_init(ObjectClass *klass,
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index e0e9f0b..b3c018f 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -53,6 +53,7 @@
+ #include "system/runstate.h"
+ #include "system/system.h"
+ #include "system/tcg.h"
++#include "hw/misc/unimp.h"
+ #include "target/arm/gtimer.h"
+ #include "target/arm/cpu.h"
+ #include "target/arm/cpu-features.h"
+@@ -114,7 +115,7 @@ enum {
+ 
+ static const MemMapEntry memmap[] = {
+     [VMAPPLE_FIRMWARE] =           { 0x00100000, 0x00100000 },
+-    [VMAPPLE_CONFIG] =             { 0x00400000, 0x00010000 },
++    [VMAPPLE_CONFIG] =             { 0x00400000, 0x00100000 },
+ 
+     [VMAPPLE_GIC_DIST] =           { 0x10000000, 0x00010000 },
+     [VMAPPLE_GIC_REDIST] =         { 0x10010000, 0x00400000 },
+@@ -324,6 +325,19 @@ static void create_gic(VMAppleMachineState *vms, MemoryRegion *mem)
+     sysbus_realize_and_unref(gicbusdev, &error_fatal);
+     sysbus_mmio_map(gicbusdev, 0, vms->memmap[VMAPPLE_GIC_DIST].base);
+     sysbus_mmio_map(gicbusdev, 1, vms->memmap[VMAPPLE_GIC_REDIST].base);
++    if (tcg_enabled()) {
++        DeviceState *msi = qdev_new("arm-gicv2m");
++
++        qdev_prop_set_uint32(msi, "base-spi", 64);
++        qdev_prop_set_uint32(msi, "num-spi", 128);
++        qdev_prop_set_bit(msi, "typer-valid", true);
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(msi), &error_fatal);
++        sysbus_mmio_map(SYS_BUS_DEVICE(msi), 0, 0x1fff0000);
++        for (i = 0; i < 128; i++) {
++            sysbus_connect_irq(SYS_BUS_DEVICE(msi), i,
++                               qdev_get_gpio_in(vms->gic, 64 + i));
++        }
++    }
+ 
+     /*
+      * Wire the outputs from each CPU's generic timer and the GICv3
+@@ -630,6 +644,8 @@ static void mach_vmapple_init(MachineState *machine)
+     create_bdif(vms, sysmem);
+     create_pvpanic(vms, sysmem);
+     create_aes(vms, sysmem);
++    create_unimplemented_device("vmapple-boot-probe", 0x30240000, 0x10000);
++    create_unimplemented_device("vmapple-ctrr-probe", 0x30260000, 0x10000);
+     create_gfx(vms, sysmem);
+     create_uart(vms, VMAPPLE_UART, sysmem, serial_hd(0));
+     create_rtc(vms);
+@@ -703,7 +719,8 @@ static const CPUArchIdList *vmapple_possible_cpu_arch_ids(MachineState *ms)
+ }
+ 
+ static GlobalProperty vmapple_compat_defaults[] = {
+-    { TYPE_VIRTIO_PCI, "disable-legacy", "on" },
++    /* Modern-only devices do not expose the legacy transport property. */
++    { TYPE_VIRTIO_PCI, "disable-legacy", "on", .optional = true },
+     /*
+      * macOS XHCI driver attempts to schedule events onto even rings 1 & 2
+      * even when (as here) there is no MSI(-X) support. Disabling interrupter
+diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+index 787e4dc..4f366ce 100644
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -1924,7 +1924,8 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
+     }
+ #ifndef CONFIG_USER_ONLY
+     {
+-        uint64_t scale = gt_cntfrq_period_ns(cpu);
++        /* VMApple's 24 MHz clock needs fractional nanosecond periods. */
++        uint64_t scale = cpu->pauth_impdef_compat ? 1 : gt_cntfrq_period_ns(cpu);
+ 
+         cpu->gt_timer[GTIMER_PHYS] = timer_new(QEMU_CLOCK_VIRTUAL, scale,
+                                                arm_gt_ptimer_cb, cpu);
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index af45234..5b70230 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -1355,6 +1355,10 @@ uint64_t gt_get_countervalue(CPUARMState *env)
+ {
+     ARMCPU *cpu = env_archcpu(env);
+ 
++    if (cpu->pauth_impdef_compat) {
++        return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
++                        cpu->gt_cntfrq_hz, NANOSECONDS_PER_SECOND);
++    }
+     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / gt_cntfrq_period_ns(cpu);
+ }
+ 
+@@ -1545,7 +1549,16 @@ static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
+          * set the timer for as far in the future as possible. When the
+          * timer expires we will reset the timer for any remaining period.
+          */
+-        if (nexttick > INT64_MAX / gt_cntfrq_period_ns(cpu)) {
++        if (cpu->pauth_impdef_compat) {
++            uint64_t max_ticks = muldiv64(INT64_MAX, cpu->gt_cntfrq_hz,
++                                          NANOSECONDS_PER_SECOND);
++            uint64_t deadline = nexttick > max_ticks ? INT64_MAX :
++                muldiv64_round_up(nexttick, NANOSECONDS_PER_SECOND,
++                                 cpu->gt_cntfrq_hz);
++
++            /* Round up so expiry never precedes the requested counter tick. */
++            timer_mod_ns(cpu->gt_timer[timeridx], deadline);
++        } else if (nexttick > INT64_MAX / gt_cntfrq_period_ns(cpu)) {
+             timer_mod_ns(cpu->gt_timer[timeridx], INT64_MAX);
+         } else {
+             timer_mod(cpu->gt_timer[timeridx], nexttick);
+@@ -6343,6 +6356,30 @@ void register_cp_regs_for_features(ARMCPU *cpu)
+     }
+ 
+     define_arm_cp_regs(cpu, cp_reginfo);
++    if (cpu->pauth_impdef_compat) {
++        /* Prototype diagnostic registers: read zero, writes ignored. */
++        static const ARMCPRegInfo vm_diagnostics[] = {
++            { .name = "VM_DIAG_6_0", .state = ARM_CP_STATE_AA64,
++              .opc0 = 3, .opc1 = 6, .crn = 15, .crm = 0, .opc2 = 0,
++              .access = PL1_RW, .type = ARM_CP_CONST },
++            { .name = "VM_DIAG_3_8", .state = ARM_CP_STATE_AA64,
++              .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 8, .opc2 = 0,
++              .access = PL1_RW, .type = ARM_CP_CONST },
++            { .name = "VM_DIAG_3_9", .state = ARM_CP_STATE_AA64,
++              .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 9, .opc2 = 0,
++              .access = PL1_RW, .type = ARM_CP_CONST },
++            { .name = "VM_DIAG_3_10", .state = ARM_CP_STATE_AA64,
++              .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 10, .opc2 = 0,
++              .access = PL1_RW, .type = ARM_CP_CONST },
++            { .name = "VM_DIAG_3_0", .state = ARM_CP_STATE_AA64,
++              .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 0, .opc2 = 0,
++              .access = PL1_RW, .type = ARM_CP_CONST },
++            { .name = "VM_DIAG_4_0", .state = ARM_CP_STATE_AA64,
++              .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 0, .opc2 = 0,
++              .access = PL1_RW, .type = ARM_CP_CONST },
++        };
++        define_arm_cp_regs(cpu, vm_diagnostics);
++    }
+     if (!arm_feature(env, ARM_FEATURE_V8)) {
+         /*
+          * Must go early as it is full of wildcards that may be
+@@ -8012,6 +8049,11 @@ void define_one_arm_cp_reg(ARMCPU *cpu, const ARMCPRegInfo *r)
+             /* broken reginfo with out-of-range opc1 */
+             g_assert_not_reached();
+         }
++        if (cpu->pauth_impdef_compat && r->opc0 == 3 && r->crn == 15 &&
++            g_str_has_prefix(r->name, "VM_DIAG_")) {
++            /* The virtual platform's diagnostic ABI permits EL1 reads. */
++            mask |= PL1_RW;
++        }
+         /* assert our permissions are not too lax (stricter is fine) */
+         assert((r->access & ~mask) == 0);
+     }
+diff --git a/target/arm/tcg/psci.c b/target/arm/tcg/psci.c
+index 56754bd..da10a31 100644
+--- a/target/arm/tcg/psci.c
++++ b/target/arm/tcg/psci.c
+@@ -83,6 +83,25 @@ void arm_handle_psci_call(ARMCPU *cpu)
+     trace_arm_psci_call(param[0], param[1], param[2], param[3],
+                         arm_cpu_mp_affinity(cpu));
+ 
++    /*
++     * Prototype acknowledgements for VMApple's existing compatibility PAC
++     * model. This does not implement the per-process key service.
++     */
++    if (is_a64(env) && cpu->pauth_impdef_compat &&
++        (param[0] & 0xffff0000) == 0xc1000000) {
++        if (param[0] == 0xc1000000 && getenv("MACDESK_TRACE_HANDOFF")) {
++            fprintf(stderr, "prototype handoff: pc=%" PRIx64
++                    " x20=%" PRIx64 " x21=%" PRIx64 "\n",
++                    env->pc, env->xregs[20], env->xregs[21]);
++            qemu_system_debug_request();
++        }
++        if (param[0] == 0xc1000001) {
++            env->xregs[2] = 1;
++            env->xregs[3] = 2;
++        }
++        goto err;
++    }
++
+     if ((param[0] & QEMU_PSCI_0_2_64BIT) && !is_a64(env)) {
+         ret = QEMU_PSCI_RET_NOT_SUPPORTED;
+         goto err;
